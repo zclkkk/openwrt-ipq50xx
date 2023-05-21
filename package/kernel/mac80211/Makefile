@@ -10,10 +10,18 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mac80211
 
+ifneq ($(CONFIG_TARGET_ipq50xx),)
+PKG_VERSION:=20210222-$(LINUX_VERSION)
+PKG_SOURCE_PROTO:=generate-backports
+PKG_SOURCE_URL:=x
+PKG_SOURCE_SUBDIR:=backports-$(PKG_VERSION)
+PKG_MIRROR_HASH:=skip
+else
 PKG_VERSION:=5.10.168-1
 PKG_RELEASE:=1
 PKG_SOURCE_URL:=@KERNEL/linux/kernel/projects/backports/stable/v5.10.168/
 PKG_HASH:=ba43215e99b367febaad507c94423b156c7af9a415d978fbc630e9e8d6641d73
+endif
 
 PKG_SOURCE:=backports-$(PKG_VERSION).tar.xz
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/backports-$(PKG_VERSION)
@@ -39,6 +47,7 @@ PKG_CONFIG_DEPENDS:= \
 	CONFIG_PACKAGE_MAC80211_DEBUGFS \
 	CONFIG_PACKAGE_MAC80211_MESH \
 	CONFIG_PACKAGE_MAC80211_TRACING \
+	CONFIG_PACKAGE_MAC80211_NSS_SUPPORT \
 	CONFIG_PACKAGE_IWLWIFI_DEBUG \
 	CONFIG_PACKAGE_IWLWIFI_DEBUGFS \
 	CONFIG_PACKAGE_RTLWIFI_DEBUG \
@@ -84,6 +93,7 @@ config-$(CONFIG_PACKAGE_CFG80211_TESTMODE) += NL80211_TESTMODE
 
 config-$(call config_package,mac80211) += MAC80211
 config-$(CONFIG_PACKAGE_MAC80211_MESH) += MAC80211_MESH
+config-$(CONFIG_PACKAGE_MAC80211_NSS_SUPPORT) += MAC80211_NSS_SUPPORT
 
 include ath.mk
 include broadcom.mk
@@ -127,7 +137,8 @@ define KernelPackage/mac80211
   $(call KernelPackage/mac80211/Default)
   TITLE:=Linux 802.11 Wireless Networking Stack
   # +kmod-crypto-cmac is a runtime only dependency of net/mac80211/aes_cmac.c
-  DEPENDS+= +kmod-cfg80211 +hostapd-common
+  DEPENDS+= +kmod-cfg80211 +hostapd-common \
+	+PACKAGE_MAC80211_NSS_SUPPORT:kmod-qca-nss-drv
   KCONFIG:=\
 	CONFIG_AVERAGE=y
   FILES:= $(PKG_BUILD_DIR)/net/mac80211/mac80211.ko
@@ -160,6 +171,15 @@ define KernelPackage/mac80211/config
 		default y
 
   endif
+
+	# Move out to avoid recursive dependency in Kconfig
+	config PACKAGE_MAC80211_NSS_SUPPORT
+		bool "Enable NSS support"
+		depends on TARGET_ipq50xx
+		depends on ATH11K_NSS_SUPPORT
+		help
+		  Enables NSS offload support for ATH11K driver
+
 endef
 
 define KernelPackage/mac80211/description
@@ -440,6 +460,16 @@ ifeq ($(BUILD_VARIANT),smallbuffers)
 	C_DEFINES+= -DCONFIG_ATH10K_SMALLBUFFERS
 endif
 
+ifneq ($(CONFIG_PACKAGE_MAC80211_NSS_SUPPORT),)
+	C_DEFINES+= \
+		-I$(STAGING_DIR)/usr/include/qca-nss-drv
+endif
+
+ifneq ($(CONFIG_ATH11K_NSS_SUPPORT),)
+	C_DEFINES+= \
+		-I$(STAGING_DIR)/usr/include/qca-nss-clients
+endif
+
 MAKE_OPTS:= -C "$(PKG_BUILD_DIR)" \
 	$(KERNEL_MAKE_FLAGS) \
 	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) $(C_DEFINES)" \
@@ -458,6 +488,60 @@ define mac80211_config
 $(call ConfigVars,m)$(call ConfigVars,y)
 endef
 $(eval $(call shexport,mac80211_config))
+
+ifneq ($(CONFIG_TARGET_ipq50xx),)
+
+  BACKPORTS_SOURCE_VERSION:=v5.12.19-1
+  BACKPORTS_SOURCE_SUBDIR:=backports-source-$(BACKPORTS_SOURCE_VERSION)
+  BACKPORTS_SOURCE_SOURCE:=$(BACKPORTS_SOURCE_SUBDIR).tar.xz
+  define Download/backports-source
+    PROTO:=git
+    URL:=https://git.kernel.org/pub/scm/linux/kernel/git/backports/backports.git
+    VERSION:=$(BACKPORTS_SOURCE_VERSION)
+    SUBDIR:=$(BACKPORTS_SOURCE_SUBDIR)
+    FILE:=$(BACKPORTS_SOURCE_SOURCE)
+    MIRROR_HASH:=skip
+  endef
+  $(eval $(call Download,backports-source))
+
+  ATH_KERNEL_SOURCE_DATE:=2021-02-22
+  ATH_KERNEL_VERSION:=b157d227636eb4fd9854218c4802e8dab2eadf1b
+  ATH_KERNEL_SUBDIR:=ath-kernel-$(ATH_KERNEL_SOURCE_DATE)-$(call version_abbrev,$(ATH_KERNEL_VERSION))
+  ATH_KERNEL_SOURCE:=$(ATH_KERNEL_SUBDIR).tar.xz
+  define Download/ath-kernel
+    PROTO:=git
+    URL:=https://git.codelinaro.org/clo/qsdk/kvalo/ath.git
+    VERSION:=$(ATH_KERNEL_VERSION)
+    SUBDIR:=$(ATH_KERNEL_SUBDIR)
+    FILE:=$(ATH_KERNEL_SOURCE)
+    MIRROR_HASH:=skip
+  endef
+  $(eval $(call Download,ath-kernel))
+
+  $(DL_DIR)/$(PKG_SOURCE): $(DL_DIR)/$(BACKPORTS_SOURCE_SOURCE)
+  $(DL_DIR)/$(PKG_SOURCE): $(DL_DIR)/$(ATH_KERNEL_SOURCE)
+  define DownloadMethod/generate-backports
+	$(call wrap_mirror,$(1),$(2), \
+		mkdir -p $(TMP_DIR)/dl && \
+		cd $(TMP_DIR)/dl && \
+		rm -rf $(SUBDIR) backports-source ath-kernel && \
+		mkdir -p $(SUBDIR) backports-source ath-kernel && \
+		$(HOST_TAR) -C backports-source --strip-components=1 -xJf $(DL_DIR)/$(BACKPORTS_SOURCE_SOURCE) && \
+		$(HOST_TAR) -C ath-kernel --strip-components=1 -xJf $(DL_DIR)/$(ATH_KERNEL_SOURCE) && \
+		( \
+			cd $(TMP_DIR)/dl/backports-source && \
+			PATH="/sbin:${PATH}" \
+				./gentree.py --clean \
+				$(TMP_DIR)/dl/ath-kernel \
+				$(TMP_DIR)/dl/$(SUBDIR) \
+		) && \
+		(cd $(TMP_DIR)/dl; $(call dl_tar_pack,$(TMP_DIR)/dl/$(FILE),$(SUBDIR))) && \
+		mv $(TMP_DIR)/dl/$(FILE) $(DL_DIR) && \
+		rm -rf $(SUBDIR) backports-source ath-kernel; \
+	)
+  endef
+
+endif
 
 define Build/Prepare
 	rm -rf $(PKG_BUILD_DIR)
@@ -504,27 +588,39 @@ endif
 
 define Build/Patch
 	$(if $(QUILT),rm -rf $(PKG_BUILD_DIR)/patches; mkdir -p $(PKG_BUILD_DIR)/patches)
-	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/build,build/)
-	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/subsys,subsys/)
-	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath,ath/)
-	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/rt2x00,rt2x00/)
-	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/mwl,mwl/)
-	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/brcm,brcm/)
+	$(if $(CONFIG_TARGET_ipq50xx),
+		$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/all-ipq50xx,all-ipq50xx/)
+	,
+		$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/build,build/)
+		$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/subsys,subsys/)
+		$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath,ath/)
+		$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/rt2x00,rt2x00/)
+		$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/mwl,mwl/)
+		$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/brcm,brcm/)
+	)
 	$(if $(QUILT),touch $(PKG_BUILD_DIR)/.quilt_used)
 endef
 
 define Quilt/Refresh/Package
-	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/build,build/)
-	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/subsys,subsys/)
-	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath,ath/)
-	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/rt2x00,rt2x00/)
-	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/mwl,mwl/)
-	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/brcm,brcm/)
+	$(if $(CONFIG_TARGET_ipq50xx),
+		$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/all-ipq50xx,all-ipq50xx/)
+	,
+		$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/build,build/)
+		$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/subsys,subsys/)
+		$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath,ath/)
+		$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/rt2x00,rt2x00/)
+		$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/mwl,mwl/)
+		$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/brcm,brcm/)
+	)
 endef
 
 define Build/Compile
 	$(SH_FUNC) var2file "$(call shvar,mac80211_config)" $(PKG_BUILD_DIR)/.config
-	$(MAKE) $(MAKE_OPTS) allnoconfig
+	$(if $(CONFIG_TARGET_ipq50xx),
+		$(MAKE) $(MAKE_OPTS) olddefconfig
+	,
+		$(MAKE) $(MAKE_OPTS) allnoconfig
+	)
 	$(call Build/Compile/kmod)
 endef
 
